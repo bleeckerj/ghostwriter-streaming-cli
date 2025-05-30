@@ -1,6 +1,5 @@
 use std::io;
 use std::time::{Duration, Instant};
-use anyhow::Result;
 use async_openai::types::*;
 use async_openai::Client;
 use crossterm::{
@@ -8,7 +7,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -21,8 +20,9 @@ use tokio::sync::mpsc;
 
 struct App {
     input: String,
-    current_completion: String,
-    original_completion: String, // <-- Add this
+    completions: Vec<String>,
+    original_completions: Vec<String>,  // <-- Add this to store original completions
+    current_completion_index: usize,
     last_keypress: Instant,
     completion_in_progress: bool,
 }
@@ -31,11 +31,29 @@ impl App {
     fn new() -> Self {
         Self {
             input: String::new(),
-            current_completion: String::new(),
-            original_completion: String::new(), // <-- Initialize here
+            completions: Vec::new(),
+            original_completions: Vec::new(),  // <-- Initialize
+            current_completion_index: 0,
             last_keypress: Instant::now(),
             completion_in_progress: false,
         }
+    }
+
+    fn current_completion(&self) -> &str {
+        self.completions.get(self.current_completion_index).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    fn next_completion(&mut self) {
+        if !self.completions.is_empty() {
+            self.current_completion_index = (self.current_completion_index + 1) % self.completions.len();
+        }
+    }
+
+    // Add this new method to App
+    fn should_load_more(&self) -> bool {
+        // Trigger "load more" when we're at the last item or close to it
+        !self.completions.is_empty() && 
+        self.current_completion_index >= self.completions.len().saturating_sub(1)
     }
 }
 
@@ -49,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    let (tx, mut rx) = mpsc::channel::<String>(1);
+    let (tx, mut rx) = mpsc::channel::<Vec<String>>(1);
 
     loop {
         terminal.draw(|f| {
@@ -66,10 +84,10 @@ async fn main() -> anyhow::Result<()> {
 
             let spans = vec![
                 Span::raw(&app.input),
-                Span::styled(&app.current_completion, Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC)),
+                Span::styled(app.current_completion(), Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC)),
             ];
             let paragraph = Paragraph::new(Line::from(spans))
-                .block(Block::default().borders(Borders::ALL).title("Streaming CLI"))
+                .block(Block::default().borders(Borders::ALL).title("Ghostwriter UX Exploration CLI"))
                 .wrap(Wrap { trim: true }); // Enable wrapping here
 
             f.render_widget(paragraph, chunks[0]);
@@ -80,27 +98,82 @@ async fn main() -> anyhow::Result<()> {
                 match key.code {
                     KeyCode::Char(c) => {
                         app.input.push(c);
-                        if app.current_completion.starts_with(c) {
-                            app.current_completion.remove(0);
+                        
+                        // If we have completions and the typed character matches the next character
+                        // in the current completion, remove it from the completion
+                        if !app.completions.is_empty() && app.current_completion().starts_with(c) {
+                            let current_idx = app.current_completion_index;
+                            let mut completion = app.completions[current_idx].clone();
+                            completion.remove(0); // Remove the matched character
+                            app.completions[current_idx] = completion;
                         } else {
-                            app.current_completion.clear();
+                            // If mismatch or no completions, clear them
+                            app.completions.clear();
+                            app.original_completions.clear();
                         }
+                        
                         app.last_keypress = Instant::now();
                     }
                     KeyCode::Backspace => {
-                        app.input.pop();
-                        // Restore completion if input matches original completion again
-                        if app.original_completion.starts_with(&app.input) {
-                            app.current_completion = app.original_completion[app.input.len()..].to_string();
-                        } else {
-                            app.current_completion.clear();
+                        if !app.input.is_empty() {
+                            app.input.pop();
+                            
+                            // If we have original completions, check if we can restore
+                            if !app.original_completions.is_empty() {
+                                let current_idx = app.current_completion_index;
+                                if current_idx < app.original_completions.len() {
+                                    let original = &app.original_completions[current_idx];
+                                    
+                                    // If input is a prefix of the original completion source
+                                    if original.starts_with(&app.input) {
+                                        // Restore the completion for this position
+                                        app.completions[current_idx] = original[app.input.len()..].to_string();
+                                    }
+                                }
+                            } else {
+                                app.completions.clear();
+                            }
                         }
+                        
                         app.last_keypress = Instant::now();
                     }
                     KeyCode::Tab => {
-                        if !app.current_completion.is_empty() {
-                            app.input.push_str(&app.current_completion);
-                            app.current_completion.clear();
+                        if !app.current_completion().is_empty() {
+                            let current_completion = app.current_completion().to_string();
+                            if !current_completion.is_empty() {
+                                app.input.push_str(&current_completion);
+                            }
+                            app.completions.clear();
+                            app.original_completions.clear();
+                            app.current_completion_index = 0;
+                        }
+                    }
+                    KeyCode::Down => {
+                        app.next_completion(); // cycle through completions
+                        
+                        // If we're at or near the end of available completions, request more
+                        if app.should_load_more() && !app.completion_in_progress {
+                            let prompt = app.input.clone();
+                            let tx_clone = tx.clone();
+                            app.completion_in_progress = true;
+                            
+                            tokio::spawn(async move {
+                                if let Ok(new_completions) = stream_multiple_openai_completions(&prompt, 3).await {
+                                    if !new_completions.is_empty() {
+                                        let _ = tx_clone.send(new_completions).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    KeyCode::Up => {
+                        if !app.completions.is_empty() {
+                            // Go to previous completion or wrap to the end
+                            app.current_completion_index = if app.current_completion_index > 0 {
+                                app.current_completion_index - 1
+                            } else {
+                                app.completions.len() - 1
+                            };
                         }
                     }
                     KeyCode::Esc => break,
@@ -111,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
 
         if app.last_keypress.elapsed() > Duration::from_millis(600)
             && !app.input.is_empty()
-            && app.current_completion.is_empty()
+            && app.completions.is_empty()
             && !app.completion_in_progress
         {
             let prompt = app.input.clone();
@@ -119,16 +192,26 @@ async fn main() -> anyhow::Result<()> {
             app.completion_in_progress = true;
 
             tokio::spawn(async move {
-                if let Ok(completion) = stream_openai_completion(&prompt).await {
-                    let _ = tx_clone.send(completion).await;
+                if let Ok(completions) = stream_multiple_openai_completions(&prompt, 3).await {
+                    if !completions.is_empty() {
+                        let _ = tx_clone.send(completions).await;
+                    }
                 }
             });
         }
 
         // Check if the completion task has finished:
-        if let Ok(completion) = rx.try_recv() {
-            app.current_completion = completion.clone();
-            app.original_completion = completion; // <-- store original completion
+        if let Ok(new_completions) = rx.try_recv() {
+            if app.completions.is_empty() {
+                // First set of completions
+                app.completions = new_completions.clone();
+                app.original_completions = new_completions;
+                app.current_completion_index = 0;
+            } else {
+                // Add new completions to existing ones
+                app.completions.extend(new_completions.clone());
+                app.original_completions.extend(new_completions);
+            }
             app.completion_in_progress = false;
         }
     }
@@ -140,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
     let request = CreateChatCompletionRequestArgs::default()
-        .model("gpt-4o")
+        .model("gpt-4.1-nano-2025-04-14")
         .messages(vec![
             ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessageArgs::default()
@@ -156,7 +239,7 @@ async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
         .stream(true)
         .build()?;
 
-    let client = Client::new();
+    let client = Client::<async_openai::config::OpenAIConfig>::new();
     let mut stream = client.chat().create_stream(request).await?;
 
     let mut output = String::new();
@@ -167,4 +250,27 @@ async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
     }
 
     Ok(output)
+}
+
+
+async fn stream_multiple_openai_completions(prompt: &str, num_completions: usize) -> anyhow::Result<Vec<String>> {
+    let client = Client::new();
+
+    let futures = (0..num_completions).map(|_| {
+        let prompt = prompt.to_string();
+        //let client = client.clone();
+        tokio::spawn(async move {
+            stream_openai_completion(&prompt).await
+        })
+    });
+
+    let results = join_all(futures).await;
+
+    // Collect successful completions
+    let completions: Vec<String> = results.into_iter()
+        .filter_map(|res| res.ok())
+        .filter_map(|res| res.ok())
+        .collect();
+
+    Ok(completions)
 }
