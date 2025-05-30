@@ -1,3 +1,6 @@
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(unused)]
 use std::io;
 use std::time::{Duration, Instant};
 use async_openai::types::*;
@@ -227,7 +230,7 @@ async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
         .messages(vec![
             ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessageArgs::default()
-                    .content("You are a helpful and creative assistant that completes partial thoughts. You should only respond with the completion of the user's input with no more than 2-5 sentences.")
+                    .content("You are a helpful and creative assistant that completes partial thoughts. You should only respond with the completion of the user's input with no more than 2-5 sentences. The response should have a Automated Readability Index of no more than 2.")
                     .build()?,
             ),
             ChatCompletionRequestMessage::User(
@@ -254,7 +257,7 @@ async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
 
 
 async fn stream_multiple_openai_completions(prompt: &str, num_completions: usize) -> anyhow::Result<Vec<String>> {
-    let client = Client::new();
+    //let client = Client::new();
 
     let futures = (0..num_completions).map(|_| {
         let prompt = prompt.to_string();
