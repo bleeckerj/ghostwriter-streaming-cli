@@ -20,6 +20,19 @@ use ratatui::{
     Terminal,
 };
 use tokio::sync::mpsc;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Model API endpoint to use: "openai" or a custom URL for LM Studio
+    #[arg(short, long, default_value = "openai")]
+    endpoint: String,
+
+    /// Model name to use
+    #[arg(short, long, default_value = "gpt-4o")]
+    model: String,
+}
 
 struct App {
     input: String,
@@ -143,8 +156,8 @@ async fn main() -> anyhow::Result<()> {
                     KeyCode::Tab => {
                         if !app.current_completion().is_empty() {
                             let current_completion = app.current_completion().to_string();
-                            if !current_completion.is_empty() {
-                                app.input.push_str(&current_completion);
+                            if !currentCompletion.is_empty() {
+                                app.input.push_str(&currentCompletion);
                             }
                             app.completions.clear();
                             app.original_completions.clear();
@@ -224,9 +237,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
+async fn stream_openai_completion(endpoint: &str, model: &str, prompt: &str) -> anyhow::Result<String> {
+    let client = if endpoint == "openai" {
+        // Use default OpenAI configuration
+        Client::<async_openai::config::OpenAIConfig>::new()
+    } else {
+        // Use custom endpoint (LM Studio)
+        let config = async_openai::config::Config::new()
+            .with_api_base(endpoint)
+            .with_api_key("no-api-key-required"); // LM Studio typically doesn't require an API key
+        
+        Client::with_config(config)
+    };
+
     let request = CreateChatCompletionRequestArgs::default()
-        .model("gpt-4.1-nano-2025-04-14")
+        .model(model)
         .messages(vec![
             ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessageArgs::default()
@@ -242,7 +267,6 @@ async fn stream_openai_completion(prompt: &str) -> anyhow::Result<String> {
         .stream(true)
         .build()?;
 
-    let client = Client::<async_openai::config::OpenAIConfig>::new();
     let mut stream = client.chat().create_stream(request).await?;
 
     let mut output = String::new();

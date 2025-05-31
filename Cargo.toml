@@ -11,3 +11,4 @@ crossterm = "0.29.0"
 async-openai = "0.28.1"
 dotenv = "0.15.0"
 anyhow = "1.0.98"
+clap = { version = "4.5.39", features = ["derive"] }
