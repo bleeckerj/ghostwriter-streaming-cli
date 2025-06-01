@@ -97,7 +97,7 @@ The AI completions are designed to continue your text naturally without adding q
     Or, for LM Studio or another local model:
 
     ```sh
-    cargo run --release -- --endpoint http://localhost:1234 --model your-model-name
+    cargo run --release -- --endpoint http://localhost:1234/v1 --model your-model-name
     ```
 
     **Command-line options:**

@@ -239,6 +239,15 @@ impl App {
             self.set_cursor_from_line_col();
         }
     }
+    
+    /// Call this after any cursor movement or edit to keep the cursor visible.
+    pub fn update_scroll_offset(&mut self, max_visible_lines: usize) {
+        if self.cursor_line < self.scroll_line_offset {
+            self.scroll_line_offset = self.cursor_line;
+        } else if self.cursor_line >= self.scroll_line_offset + max_visible_lines {
+            self.scroll_line_offset = self.cursor_line - max_visible_lines + 1;
+        }
+    }
 }
 
 #[tokio::main]
@@ -270,399 +279,465 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<String>>(1);
     
     loop {
+        // Calculate terminal size and layout before drawing
+        let size = terminal.get_frame().area();
+        let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(8),
+        ])
+        .split(size);
+
+        app.editor_width = chunks[0].width as usize - 2; // minus borders
+        let max_visible_lines = chunks[0].height as usize - 2; // minus borders
+
         terminal.draw(|f| {
-            let size = f.area();
-            let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(2)
-            .constraints([
-                Constraint::Min(1),      // Main editor area
-                Constraint::Length(1),   // Yellow separator
-                Constraint::Length(8),   // Debug area (2 lines tall)
-                ])
-                .split(size);
-                
-                app.editor_width = chunks[0].width as usize - 2; // minus borders
-                
-                let lines: Vec<&str> = app.input.split('\n').collect();
-                let max_visible_lines = chunks[0].height as usize - 2; // minus borders
-                
-                // Adjust scroll offset
-                if app.cursor_line < app.scroll_line_offset {
-                    app.scroll_line_offset = app.cursor_line;
-                } else if app.cursor_line >= app.scroll_line_offset + max_visible_lines {
-                    app.scroll_line_offset = app.cursor_line - max_visible_lines + 1;
-                }
-                
-                // Get visible lines
-                let visible_lines = &lines[app.scroll_line_offset..app.scroll_line_offset + max_visible_lines.min(lines.len() - app.scroll_line_offset)];
-                
-                // Build styled lines
-                let mut styled_lines = Vec::new();
-                for (i, line) in visible_lines.iter().enumerate() {
-                    let line_idx = app.scroll_line_offset + i;
-                    if line_idx == app.cursor_line {
-                        // Highlight cursor position
-                        let col = app.cursor_col.min(line.chars().count());
-                        let (before, at, after) = {
-                            let mut before = String::new();
-                            let mut at = String::new();
-                            let mut after = String::new();
-                            let mut chars = line.chars();
-                            for _ in 0..col {
-                                if let Some(c) = chars.next() {
-                                    before.push(c);
-                                }
-                            }
-                            if let Some(c) = chars.next() {
-                                at.push(c);
-                            } else {
-                                at.push(' ');
-                            }
-                            after = chars.collect();
-                            (before, at, after)
-                        };
-                        styled_lines.push(Line::from(vec![
-                            Span::raw(before),
-                            Span::styled(at, Style::default().bg(Color::White).fg(Color::Black)),
-                            Span::raw(after),
-                            // Render the blue box only if there is completion text
-                            if !app.current_completion().is_empty() {
-                                Span::styled(
-                                    app.current_completion(),
-                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC | Modifier::BOLD),
-                                )
-                            } else {
-                                Span::raw("") // Render nothing if there is no completion text
-                            },
-                            ]));
-                        } else {
-                            styled_lines.push(Line::from(vec![Span::raw(*line)]));
-                        }
-                    }
-                    
-                    let paragraph = Paragraph::new(styled_lines)
-                    .block(Block::default().borders(Borders::ALL).title("Ghostwriter UX Exploration CLI"))
-                    .wrap(Wrap { trim: false }); // soft wrapping
-                    
-                    f.render_widget(paragraph, chunks[0]);
-                    
-                    // Yellow separator line
-                    let separator = Line::from(vec![Span::styled(
-                        "─".repeat(chunks[1].width as usize),
-                        Style::default().fg(Color::Yellow),
-                    )]);
-                    f.render_widget(Paragraph::new(separator), chunks[1]);
-                    
-                    // Debug area
-                    let debug = Paragraph::new(app.debug_message.lock().unwrap().clone())
-                    .block(Block::default().borders(Borders::ALL).title("Debug"))
-                    .style(Style::default().fg(Color::Yellow));
-                    f.render_widget(debug, chunks[2]);
-                    
-                    // After rendering the main editor area (paragraph)
-                    let current_line = lines.get(app.cursor_line).unwrap_or(&"");
-                    let editor_width = chunks[0].width as usize - 2; // minus borders
-                    
-                    // Calculate visual position accounting for wrapping
-                    let visual_line = app.cursor_col / editor_width;
-                    let visual_col = app.cursor_col % editor_width;
-                    
-                    // Simple cursor positioning that matches soft-wrapped rendering
-                    let base_y = chunks[0].y + 1;
-                    let line_offset = if app.cursor_line >= app.scroll_line_offset {
-                        app.cursor_line - app.scroll_line_offset
-                    } else {
-                        0
-                    };
-                    
-                    // Don't try to calculate wrapping - let the terminal handle it naturally
-                    let cursor_y = base_y.saturating_add(line_offset as u16);
-                    let cursor_x = chunks[0].x + 1 + app.cursor_col as u16;
-                    
-                    // Clamp to editor bounds
-                    let max_x = chunks[0].x + chunks[0].width - 2;
-                    let cursor_x = cursor_x.min(max_x);
-                    
-                    f.set_cursor_position(ratatui::layout::Position { x: cursor_x, y: cursor_y });
-                    app.debug_message.lock().unwrap().push_str(&format!(
-                        "cursor_x: {}, cursor_y: {}, line: {}, col: {}, pos: {}",
-                        cursor_x, cursor_y, app.cursor_line, app.cursor_col, app.cursor_position
-                    ));
-                })?;
-                
-                if event::poll(Duration::from_millis(100))? {
-                    if let Event::Key(key) = event::read()? {
-                        match key {
-                            KeyEvent {
-                                code: KeyCode::Up,
-                                modifiers: KeyModifiers::SHIFT,
-                                ..
-                            } => {
-                                // Ctrl-Up: previous completion
-                                if !app.completions.is_empty() {
-                                    if app.current_completion_index == 0 {
-                                        app.current_completion_index = app.completions.len() - 1;
-                                    } else {
-                                        app.current_completion_index -= 1;
-                                    }
-                                }
-                            }
-                            KeyEvent {
-                                code: KeyCode::Down,
-                                modifiers: KeyModifiers::SHIFT,
-                                ..
-                            } => {
-                                // Ctrl-Down: next completion
-                                //let debug_log = Arc::clone(&app.debug_message);
-                                app.next_completion();
-                                // If we're at or near the end, trigger load more
-                                if app.should_load_more() && !app.completion_in_progress {
-                                    let prompt = app.input.clone();
-                                    let tx_clone = tx.clone();
-                                    app.completion_in_progress = true;
-                                    let args_clone = args.clone();
-                                    let api_key_clone = api_key.clone();
-                                    //let debug_log = Arc::clone(&app.debug_message);
-                                    tokio::spawn(async move {
-                                        {
-                                            // let mut dbg = debug_log.lock().unwrap();
-                                            // dbg.push_str("Some debug info");
-                                        } // lock is dropped here, BEFORE any await
-
-                                        let effective_model = if args_clone.endpoint == "openai" {
-                                            args_clone.model
-                                        } else {
-                                            args_clone.lm_model
-                                        };
-
-                                        if let Ok(completions) = stream_multiple_openai_completions(
-                                            &args_clone.endpoint, &effective_model, &api_key_clone, &prompt, 3
-                                        ).await {
-                                            if !completions.is_empty() {
-                                                let _ = tx_clone.send(completions).await;
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            
-                            KeyEvent { code: KeyCode::Char(c), modifiers, .. }
-                            if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
-                            {
-                                // Accept all normal typing, including Shift and CapsLock
-                                app.input.insert(app.cursor_position, c);
-                                app.cursor_position += 1;
-                                app.update_cursor_line_col();
-                                
-                                // Reset the flag here:
-                                if app.waiting_for_user_input {
-                                    app.waiting_for_user_input = false;
-                                }
-                                
-                                if !app.completions.is_empty() && app.current_completion().starts_with(c) {
-                                    let current_idx = app.current_completion_index;
-                                    let mut completion = app.completions[current_idx].clone();
-                                    completion.remove(0);
-                                    app.completions[current_idx] = completion;
-                                } else {
-                                    app.completions.clear();
-                                    app.original_completions.clear();
-                                }
-                                app.last_keypress = Instant::now();
-                            }
-                            KeyEvent { code: KeyCode::Backspace, modifiers: KeyModifiers::NONE, .. } => {
-                                if app.cursor_position > 0 {
-                                    app.input.remove(app.cursor_position - 1);
-                                    app.cursor_position -= 1;
-                                    app.update_cursor_line_col();
-                                }
-                                if !app.original_completions.is_empty() {
-                                    let current_idx = app.current_completion_index;
-                                    if current_idx < app.original_completions.len() {
-                                        let original = &app.original_completions[current_idx];
-                                        if original.starts_with(&app.input) {
-                                            app.completions[current_idx] = original[app.input.len()..].to_string();
-                                        }
-                                    }
-                                } else {
-                                    app.completions.clear();
-                                }
-                                app.last_keypress = Instant::now();
-                            }
-                            KeyEvent { code: KeyCode::Delete, modifiers: KeyModifiers::NONE, .. } => {
-                                if app.cursor_position < app.input.len() {
-                                    // Delete character at cursor position
-                                    app.input.remove(app.cursor_position);
-                                }
-                                // Reset completions as content changed
-                                app.completions.clear();
-                                app.original_completions.clear();
-                                app.last_keypress = Instant::now();
-                            }
-                            KeyEvent { code: KeyCode::Tab, modifiers: KeyModifiers::NONE, .. } => {
-                                if !app.current_completion().is_empty() {
-                                    let current_completion = app.current_completion().to_string();
-                                    if !current_completion.is_empty() {
-                                        app.input.insert_str(app.cursor_position, &current_completion);
-                                        app.cursor_position += current_completion.len();
-                                        app.update_cursor_line_col();
-                                    }
-                                    app.completions.clear();
-                                    app.original_completions.clear();
-                                    app.current_completion_index = 0;
-                                    app.waiting_for_user_input = true; // <-- Add this
-                                }
-                            }
-                            KeyEvent { code: KeyCode::Home, modifiers: KeyModifiers::NONE, .. } => {
-                                app.cursor_position = 0;
-                            }
-                            KeyEvent { code: KeyCode::End, modifiers: KeyModifiers::NONE, .. } => {
-                                if app.cursor_position == app.input.len() && !app.current_completion().is_empty() {
-                                    let current_completion = app.current_completion().to_string();
-                                    app.input.push_str(&current_completion);
-                                    app.cursor_position += current_completion.len();
-                                    app.completions.clear();
-                                    app.original_completions.clear();
-                                    app.current_completion_index = 0;
-                                } else {
-                                    app.cursor_position = app.input.len();
-                                }
-                            }
-                            KeyEvent { code: KeyCode::Esc, .. } => {
-                                //app.debug_message.lock().unwrap().push_str(stringify!("\nExiting..."));
-                                break
-                            }
-                            KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. } => {
-                                app.move_cursor_up_visual(app.editor_width);
-                            }
-                            KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. } => {
-                                app.move_cursor_down_visual(app.editor_width);
-                            }
-                            KeyEvent { code: KeyCode::Left, modifiers: KeyModifiers::NONE, .. } => {
-                                if app.cursor_col > 0 {
-                                    app.cursor_col -= 1;
-                                    app.set_cursor_from_line_col();
-                                } else if app.cursor_line > 0 {
-                                    app.cursor_line -= 1;
-                                    app.cursor_col = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
-                                    app.set_cursor_from_line_col();
-                                }
-                            }
-                            KeyEvent { code: KeyCode::Right, modifiers: KeyModifiers::NONE, .. } => {
-                                let line_len = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
-                                if app.cursor_col < line_len {
-                                    app.cursor_col += 1;
-                                    app.set_cursor_from_line_col();
-                                } else if app.cursor_line + 1 < app.input.lines().count() {
-                                    app.cursor_line += 1;
-                                    app.cursor_col = 0;
-                                    app.set_cursor_from_line_col();
-                                }
-                            }
-                            KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, .. } => {
-                                app.input.insert(app.cursor_position, '\n');
-                                app.cursor_position += 1;
-                                app.update_cursor_line_col();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                
-                if app.last_keypress.elapsed() > Duration::from_millis(600)
-                && !app.input.is_empty()
-                && app.completions.is_empty()
-                && !app.completion_in_progress
-                && !app.waiting_for_user_input // waiting for the user to type something
-                
-                {
-                    let prompt = app.input.clone();
-                    let tx_clone = tx.clone();
-                    app.completion_in_progress = true;
-                    let endpoint = args.endpoint.clone();
-                    let model = args.model.clone();
-                    let lm_model = args.lm_model.clone(); // Clone the LM model separately
-                    let api_key_clone = api_key.clone(); // Clone the API key
-                    tokio::spawn(async move {
-                        // Choose appropriate model based on endpoint
-                        let effective_model = if endpoint == "openai" {
-                            model
-                        } else {
-                            lm_model  // Use LM Studio model here
-                        };
-                        
-                        //let debug_log = app.debug_message.clone();
-                        if let Ok(completions) = stream_multiple_openai_completions(&endpoint, &effective_model, &api_key_clone, &prompt, 3).await {
-                            if !completions.is_empty() {
-                                let _ = tx_clone.send(completions).await;
-                            }
-                        }
-                    });
-                }
-                
-                // Check if the completion task has finished:
-                if let Ok(new_completions) = rx.try_recv() {
-                    app.debug_message.lock().unwrap().push_str(&format!("Received {} completions", new_completions.len()));
-                    app.debug_message.lock().unwrap().push_str("\nCompletions: ");
-                    app.debug_message.lock().unwrap().push_str(&new_completions.join(", "));
-                    if app.completions.is_empty() {
-                        // First set of completions
-                        app.completions = new_completions.clone();
-                        app.original_completions = new_completions;
-                        app.current_completion_index = 0;
-                    } else {
-                        // Add new completions to existing ones
-                        app.completions.extend(new_completions.clone());
-                        app.original_completions.extend(new_completions);
-                    }
-                    app.completion_in_progress = false;
-                }
+            let lines: Vec<&str> = app.input.split('\n').collect();
+            
+            // Adjust scroll offset
+            if app.cursor_line < app.scroll_line_offset {
+                app.scroll_line_offset = app.cursor_line;
+            } else if app.cursor_line >= app.scroll_line_offset + max_visible_lines {
+                app.scroll_line_offset = app.cursor_line - max_visible_lines + 1;
             }
             
-            disable_raw_mode()?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-            Ok(())
+            // Get visible lines
+            let visible_lines = &lines[app.scroll_line_offset..app.scroll_line_offset + max_visible_lines.min(lines.len() - app.scroll_line_offset)];
+            
+            // Build styled lines
+            let mut styled_lines = Vec::new();
+            for (i, line) in visible_lines.iter().enumerate() {
+                let line_idx = app.scroll_line_offset + i;
+                if line_idx == app.cursor_line {
+                    // Highlight cursor position
+                    let col = app.cursor_col.min(line.chars().count());
+                    let (before, at, after) = {
+                        let mut before = String::new();
+                        let mut at = String::new();
+                        let mut after = String::new();
+                        let mut chars = line.chars();
+                        for _ in 0..col {
+                            if let Some(c) = chars.next() {
+                                before.push(c);
+                            }
+                        }
+                        if let Some(c) = chars.next() {
+                            at.push(c);
+                        } else {
+                            at.push(' ');
+                        }
+                        after = chars.collect();
+                        (before, at, after)
+                    };
+                    styled_lines.push(Line::from(vec![
+                        Span::raw(before),
+                        Span::styled(at, Style::default().bg(Color::White).fg(Color::Black)),
+                        Span::raw(after),
+                        // Render the blue box only if there is completion text
+                        if !app.current_completion().is_empty() {
+                            Span::styled(
+                                app.current_completion(),
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC | Modifier::BOLD),
+                            )
+                        } else {
+                            Span::raw("") // Render nothing if there is no completion text
+                        },
+                        ]));
+                    } else {
+                        styled_lines.push(Line::from(vec![Span::raw(*line)]));
+                    }
+                }
+                
+                let paragraph = Paragraph::new(styled_lines)
+                .block(Block::default().borders(Borders::ALL).title("Ghostwriter UX Exploration CLI"))
+                .wrap(Wrap { trim: false }); // soft wrapping
+                
+                f.render_widget(paragraph, chunks[0]);
+                
+                // Yellow separator line
+                let separator = Line::from(vec![Span::styled(
+                    "─".repeat(chunks[1].width as usize),
+                    Style::default().fg(Color::Yellow),
+                )]);
+                f.render_widget(Paragraph::new(separator), chunks[1]);
+                
+                // Debug area
+                let debug = Paragraph::new(app.debug_message.lock().unwrap().clone())
+                .block(Block::default().borders(Borders::ALL).title("Debug"))
+                .style(Style::default().fg(Color::Yellow));
+                f.render_widget(debug, chunks[2]);
+                
+                // After rendering the main editor area (paragraph)
+                let current_line = lines.get(app.cursor_line).unwrap_or(&"");
+                let editor_width = chunks[0].width as usize - 2; // minus borders
+                
+                // Calculate visual position accounting for wrapping
+                let visual_line = app.cursor_col / editor_width;
+                let visual_col = app.cursor_col % editor_width;
+                
+                // Simple cursor positioning that matches soft-wrapped rendering
+                let base_y = chunks[0].y + 1;
+                let line_offset = if app.cursor_line >= app.scroll_line_offset {
+                    app.cursor_line - app.scroll_line_offset
+                } else {
+                    0
+                };
+                
+                // Don't try to calculate wrapping - let the terminal handle it naturally
+                let cursor_y = base_y.saturating_add(line_offset as u16);
+                let cursor_x = chunks[0].x + 1 + app.cursor_col as u16;
+                
+                // Clamp to editor bounds
+                let max_x = chunks[0].x + chunks[0].width - 2;
+                let cursor_x = cursor_x.min(max_x);
+                
+                f.set_cursor_position(ratatui::layout::Position { x: cursor_x, y: cursor_y });
+                app.debug_message.lock().unwrap().push_str(&format!(
+                    "cursor_x: {}, cursor_y: {}, line: {}, col: {}, pos: {}",
+                    cursor_x, cursor_y, app.cursor_line, app.cursor_col, app.cursor_position
+                ));
+            })?;
+            
+            // Now you can use max_visible_lines in your event loop:
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    match key {
+                        KeyEvent {
+                            code: KeyCode::Up,
+                            modifiers: KeyModifiers::SHIFT,
+                            ..
+                    } => {
+                        // Ctrl-Up: previous completion
+                        if !app.completions.is_empty() {
+                            if app.current_completion_index == 0 {
+                                app.current_completion_index = app.completions.len() - 1;
+                            } else {
+                                app.current_completion_index -= 1;
+                            }
+                        }
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } => {
+                        // Ctrl-Down: next completion
+                        //let debug_log = Arc::clone(&app.debug_message);
+                        app.next_completion();
+                        // If we're at or near the end, trigger load more
+                        if app.should_load_more() && !app.completion_in_progress {
+                            let prompt = app.input.clone();
+                            let tx_clone = tx.clone();
+                            app.completion_in_progress = true;
+                            let args_clone = args.clone();
+                            let api_key_clone = api_key.clone();
+                            //let debug_log = Arc::clone(&app.debug_message);
+                            tokio::spawn(async move {
+                                {
+                                    // let mut dbg = debug_log.lock().unwrap();
+                                    // dbg.push_str("Some debug info");
+                                } // lock is dropped here, BEFORE any await
+
+                                let effective_model = if args_clone.endpoint == "openai" {
+                                    args_clone.model
+                                } else {
+                                    args_clone.lm_model
+                                };
+
+                                if let Ok(completions) = stream_multiple_openai_completions(
+                                    &args_clone.endpoint, &effective_model, &api_key_clone, &prompt, 3
+                                ).await {
+                                    if !completions.is_empty() {
+                                        let _ = tx_clone.send(completions).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    
+                    KeyEvent { code: KeyCode::Char(c), modifiers, .. }
+                    if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        // Accept all normal typing, including Shift and CapsLock
+                        app.input.insert(app.cursor_position, c);
+                        app.cursor_position += 1;
+                        app.update_cursor_line_col();
+                        app.update_scroll_offset(max_visible_lines);
+                        
+                        // Reset the flag here:
+                        if app.waiting_for_user_input {
+                            app.waiting_for_user_input = false;
+                        }
+                        
+                        if !app.completions.is_empty() && app.current_completion().starts_with(c) {
+                            let current_idx = app.current_completion_index;
+                            let mut completion = app.completions[current_idx].clone();
+                            completion.remove(0);
+                            app.completions[current_idx] = completion;
+                        } else {
+                            app.completions.clear();
+                            app.original_completions.clear();
+                        }
+                        app.last_keypress = Instant::now();
+                    }
+                    KeyEvent { code: KeyCode::Backspace, modifiers: KeyModifiers::NONE, .. } => {
+                        if app.cursor_position > 0 {
+                            app.input.remove(app.cursor_position - 1);
+                            app.cursor_position -= 1;
+                            app.update_cursor_line_col();
+                            app.update_scroll_offset(max_visible_lines);
+                        }
+                        if !app.original_completions.is_empty() {
+                            let current_idx = app.current_completion_index;
+                            if current_idx < app.original_completions.len() {
+                                let original = &app.original_completions[current_idx];
+                                if original.starts_with(&app.input) {
+                                    app.completions[current_idx] = original[app.input.len()..].to_string();
+                                }
+                            }
+                        } else {
+                            app.completions.clear();
+                        }
+                        app.last_keypress = Instant::now();
+                    }
+                    KeyEvent { code: KeyCode::Delete, modifiers: KeyModifiers::NONE, .. } => {
+                        if app.cursor_position < app.input.len() {
+                            // Delete character at cursor position
+                            app.input.remove(app.cursor_position);
+                            app.update_cursor_line_col();
+                            app.update_scroll_offset(max_visible_lines);
+                        }
+                        // Reset completions as content changed
+                        app.completions.clear();
+                        app.original_completions.clear();
+                        app.last_keypress = Instant::now();
+                    }
+                    KeyEvent { code: KeyCode::Tab, modifiers: KeyModifiers::NONE, .. } => {
+                        if !app.current_completion().is_empty() {
+                            let current_completion = app.current_completion().to_string();
+                            if !current_completion.is_empty() {
+                                app.input.insert_str(app.cursor_position, &current_completion);
+                                app.cursor_position += current_completion.len();
+                                app.update_cursor_line_col();
+                            }
+                            app.completions.clear();
+                            app.original_completions.clear();
+                            app.current_completion_index = 0;
+                            app.waiting_for_user_input = true; // <-- Add this
+                        }
+                    }
+                    KeyEvent { code: KeyCode::Home, modifiers: KeyModifiers::NONE, .. } => {
+                        app.cursor_position = 0;
+                    }
+                    KeyEvent { code: KeyCode::End, modifiers: KeyModifiers::NONE, .. } => {
+                        if app.cursor_position == app.input.len() && !app.current_completion().is_empty() {
+                            let current_completion = app.current_completion().to_string();
+                            app.input.push_str(&current_completion);
+                            app.cursor_position += current_completion.len();
+                            app.completions.clear();
+                            app.original_completions.clear();
+                            app.current_completion_index = 0;
+                        } else {
+                            app.cursor_position = app.input.len();
+                        }
+                    }
+                    KeyEvent { code: KeyCode::Esc, .. } => {
+                        //app.debug_message.lock().unwrap().push_str(stringify!("\nExiting..."));
+                        break
+                    }
+                    KeyEvent { code: KeyCode::Up, .. } => {
+                        app.move_cursor_up_visual(app.editor_width);
+                        app.update_scroll_offset(max_visible_lines);
+                    }
+                    KeyEvent { code: KeyCode::Down, .. } => {
+                        app.move_cursor_down_visual(app.editor_width);
+                        app.update_scroll_offset(max_visible_lines);
+                    }
+                    KeyEvent { code: KeyCode::Left, modifiers: KeyModifiers::NONE, .. } => {
+                        if app.cursor_col > 0 {
+                            app.cursor_col -= 1;
+                            app.set_cursor_from_line_col();
+                        } else if app.cursor_line > 0 {
+                            app.cursor_line -= 1;
+                            app.cursor_col = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
+                            app.set_cursor_from_line_col();
+                        }
+                        app.update_scroll_offset(max_visible_lines);
+                    }
+                    KeyEvent { code: KeyCode::Right, modifiers: KeyModifiers::NONE, .. } => {
+                        let line_len = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
+                        if app.cursor_col < line_len {
+                            app.cursor_col += 1;
+                            app.set_cursor_from_line_col();
+                        } else if app.cursor_line + 1 < app.input.lines().count() {
+                            app.cursor_line += 1;
+                            app.cursor_col = 0;
+                            app.set_cursor_from_line_col();
+                        }
+                        app.update_scroll_offset(max_visible_lines);
+                    }
+                    KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, .. } => {
+                        app.input.insert(app.cursor_position, '\n');
+                        app.cursor_position += 1;
+                        app.update_cursor_line_col();
+                        app.update_scroll_offset(max_visible_lines);
+                    }
+                    _ => {}
+                }
+            }
         }
         
-        async fn stream_openai_completion(endpoint: &str, model: &str, api_key: &str, prompt: &str) -> anyhow::Result<String> {
-            // This function remains mostly the same, but log the model being used
-            if endpoint != "openai" {
-                //println!("Using LM Studio model: {}", model);
-            }
-            
-            let client = if endpoint == "openai" {
-                // OpenAI configuration remains unchanged
-                let config = async_openai::config::OpenAIConfig::new()
-                .with_api_key(api_key);
-                Client::with_config(config)
-            } else {
-                // For LM Studio, add more verbose logging
-                //println!("Connecting to LM Studio at: {}", endpoint);
-                let config = async_openai::config::OpenAIConfig::new()
-                .with_api_base(endpoint)
-                .with_api_key(api_key);
+        if app.last_keypress.elapsed() > Duration::from_millis(600)
+        && !app.input.is_empty()
+        && app.completions.is_empty()
+        && !app.completion_in_progress
+        && !app.waiting_for_user_input // waiting for the user to type something
+        
+        {
+            let prompt = app.input.clone();
+            let tx_clone = tx.clone();
+            app.completion_in_progress = true;
+            let endpoint = args.endpoint.clone();
+            let model = args.model.clone();
+            let lm_model = args.lm_model.clone(); // Clone the LM model separately
+            let api_key_clone = api_key.clone(); // Clone the API key
+            tokio::spawn(async move {
+                // Choose appropriate model based on endpoint
+                let effective_model = if endpoint == "openai" {
+                    model
+                } else {
+                    lm_model  // Use LM Studio model here
+                };
                 
-                Client::with_config(config)
-            };
+                //let debug_log = app.debug_message.clone();
+                if let Ok(completions) = stream_multiple_openai_completions(&endpoint, &effective_model, &api_key_clone, &prompt, 3).await {
+                    if !completions.is_empty() {
+                        let _ = tx_clone.send(completions).await;
+                    }
+                }
+            });
+        }
+        
+        // Check if the completion task has finished:
+        if let Ok(new_completions) = rx.try_recv() {
+            app.debug_message.lock().unwrap().push_str(&format!("Received {} completions", new_completions.len()));
+            app.debug_message.lock().unwrap().push_str("\nCompletions: ");
+            app.debug_message.lock().unwrap().push_str(&new_completions.join(", "));
+            if app.completions.is_empty() {
+                // First set of completions
+                app.completions = new_completions.clone();
+                app.original_completions = new_completions;
+                app.current_completion_index = 0;
+            } else {
+                // Add new completions to existing ones
+                app.completions.extend(new_completions.clone());
+                app.original_completions.extend(new_completions);
+            }
+            app.completion_in_progress = false;
+        }
+    }
+    
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+async fn stream_openai_completion(endpoint: &str, model: &str, api_key: &str, prompt: &str) -> anyhow::Result<String> {
+    // This function remains mostly the same, but log the model being used
+    if endpoint != "openai" {
+        //println!("Using LM Studio model: {}", model);
+    }
+    
+    let client = if endpoint == "openai" {
+        // OpenAI configuration remains unchanged
+        let config = async_openai::config::OpenAIConfig::new()
+        .with_api_key(api_key);
+        Client::with_config(config)
+    } else {
+        // For LM Studio, add more verbose logging
+        //println!("Connecting to LM Studio at: {}", endpoint);
+        let config = async_openai::config::OpenAIConfig::new()
+        .with_api_base(endpoint)
+        .with_api_key(api_key);
+        
+        Client::with_config(config)
+    };
+    
+    let request = CreateChatCompletionRequestArgs::default()
+    .model(model)
+    .messages(vec![
+        ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are a helpful and creative assistant that completes partial thoughts. Only continue the user’s input as plain prose in the same tone and register. Do not prepend or append ellipses, quotation marks, or any special characters. Your response is only the continuation — e.g.
+            Input: “The sun was just rising over the hills”
+            Output: “and the dew still clung to the grass, sparkling like glass.” 
+            Never begin with “...” or any symbols.
+            Do not provide answers, suggestions, or explanations in any form.
+            Do not use any special characters, punctuation, or formatting.
+            Do not wrap the output with quotation marks or any other characters. 
+            Never begin with a quotation mark. You are completing text, not provide a quotation.
+            Do not use any special formatting like bullet points, lists, or numbered items.
+            Do not use any special characters like ellipses, quotation marks, or dashes.
+            Do not repeat the user’s input. Do not add any additional commentary or explanation.
+            Your output should have an Automated Readability Index of 1 or lower. This is not a chat. Do not answer questions.")
+            .build()?,
+        ),
+        ChatCompletionRequestMessage::User(
+            ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt.to_string())
+            .build()?,
+        ),
+        ])
+        .stream(true)
+        .build()?;
+        
+        let mut stream = client.chat().create_stream(request).await?;
+        
+        let mut output = String::new();
+        
+        // Add more verbose debugging for LM Studio
+        if endpoint != "openai" {
+            //println!("Stream initialized, waiting for tokens...");
+        }
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(response) => {
+                    if let Some(fragment) = response.choices.first().and_then(|c| c.delta.content.clone()) {
+                        output.push_str(&fragment);
+                        
+                        // For debugging LM Studio responses
+                        if endpoint != "openai" {
+                            //println!("Received fragment: {}", fragment);
+                        }
+                    } else if endpoint != "openai" {
+                        // Debug when we got a response but no content
+                        //println!("Received response but no content in delta: {:?}", response);
+                    }
+                },
+                Err(e) => {
+                    // Print error but continue
+                    eprintln!("Error in stream: {}", e);
+                }
+            }
+        }
+        
+        if output.is_empty() && endpoint != "openai" {
+            // Special handling for empty responses from LM Studio
+            //println!("No output received from LM Studio");
             
-            let request = CreateChatCompletionRequestArgs::default()
+            // Try non-streaming as fallback (some LM Studio setups might not support streaming properly)
+            //println!("Attempting non-streaming fallback...");
+            
+            let non_stream_request = CreateChatCompletionRequestArgs::default()
             .model(model)
             .messages(vec![
                 ChatCompletionRequestMessage::System(
                     ChatCompletionRequestSystemMessageArgs::default()
-                    .content("You are a helpful and creative assistant that completes partial thoughts. Only continue the user’s input as plain prose in the same tone and register. Do not prepend or append ellipses, quotation marks, or any special characters. Your response is only the continuation — e.g.
-                    Input: “The sun was just rising over the hills”
-                    Output: “and the dew still clung to the grass, sparkling like glass.” 
-                    Never begin with “...” or any symbols.
-                    Do not provide answers, suggestions, or explanations in any form.
-                    Do not use any special characters, punctuation, or formatting.
-                    Do not wrap the output with quotation marks or any other characters. 
-                    Never begin with a quotation mark. You are completing text, not provide a quotation.
-                    Do not use any special formatting like bullet points, lists, or numbered items.
-                    Do not use any special characters like ellipses, quotation marks, or dashes.
-                    Do not repeat the user’s input. Do not add any additional commentary or explanation.
-                    Your output should have an Automated Readability Index of 1 or lower. This is not a chat. Do not answer questions.")
+                    .content("You are a helpful and creative assistant that completes partial thoughts. Complete the user's input with 3-5 sentences.")
                     .build()?,
                 ),
                 ChatCompletionRequestMessage::User(
@@ -671,129 +746,74 @@ async fn main() -> anyhow::Result<()> {
                     .build()?,
                 ),
                 ])
-                .stream(true)
                 .build()?;
                 
-                let mut stream = client.chat().create_stream(request).await?;
-                
-                let mut output = String::new();
-                
-                // Add more verbose debugging for LM Studio
-                if endpoint != "openai" {
-                    //println!("Stream initialized, waiting for tokens...");
-                }
-                
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(response) => {
-                            if let Some(fragment) = response.choices.first().and_then(|c| c.delta.content.clone()) {
-                                output.push_str(&fragment);
-                                
-                                // For debugging LM Studio responses
-                                if endpoint != "openai" {
-                                    //println!("Received fragment: {}", fragment);
-                                }
-                            } else if endpoint != "openai" {
-                                // Debug when we got a response but no content
-                                //println!("Received response but no content in delta: {:?}", response);
+                match client.chat().create(non_stream_request).await {
+                    Ok(response) => {
+                        if let Some(choice) = response.choices.first() {
+                            if let Some(content) = &choice.message.content {
+                                //println!("Non-streaming response: {}", content);
+                                output = content.clone();
                             }
-                        },
-                        Err(e) => {
-                            // Print error but continue
-                            eprintln!("Error in stream: {}", e);
                         }
-                    }
+                    },
+                    Err(e) => eprintln!("Non-streaming fallback failed: {}", e)
                 }
-                
-                if output.is_empty() && endpoint != "openai" {
-                    // Special handling for empty responses from LM Studio
-                    //println!("No output received from LM Studio");
-                    
-                    // Try non-streaming as fallback (some LM Studio setups might not support streaming properly)
-                    //println!("Attempting non-streaming fallback...");
-                    
-                    let non_stream_request = CreateChatCompletionRequestArgs::default()
-                    .model(model)
-                    .messages(vec![
-                        ChatCompletionRequestMessage::System(
-                            ChatCompletionRequestSystemMessageArgs::default()
-                            .content("You are a helpful and creative assistant that completes partial thoughts. Complete the user's input with 3-5 sentences.")
-                            .build()?,
-                        ),
-                        ChatCompletionRequestMessage::User(
-                            ChatCompletionRequestUserMessageArgs::default()
-                            .content(prompt.to_string())
-                            .build()?,
-                        ),
-                        ])
-                        .build()?;
-                        
-                        match client.chat().create(non_stream_request).await {
-                            Ok(response) => {
-                                if let Some(choice) = response.choices.first() {
-                                    if let Some(content) = &choice.message.content {
-                                        //println!("Non-streaming response: {}", content);
-                                        output = content.clone();
-                                    }
-                                }
-                            },
-                            Err(e) => eprintln!("Non-streaming fallback failed: {}", e)
-                        }
+            }
+            
+            Ok(output)
+        }
+        
+        
+        async fn stream_multiple_openai_completions(
+            endpoint: &str,
+            model: &str,
+            api_key: &str,
+            prompt: &str,
+            num_completions: usize,
+        ) -> anyhow::Result<Vec<String>> {
+            let futures = (0..num_completions).map(|_| {
+                let prompt = prompt.to_string();
+                let endpoint = endpoint.to_string();
+                let model = model.to_string();
+                let api_key = api_key.to_string();
+                //let debug_log = debug_log.clone();
+                tokio::spawn(async move {
+                    let result = stream_openai_completion(&endpoint, &model, &api_key, &prompt).await;
+                    if let Err(ref e) = result {
+                        //let mut dbg = debug_log.lock().unwrap();
+                        //dbg.push_str(&format!("\nOpenAI API error: {}", e));
                     }
-                    
-                    Ok(output)
-                }
-                
-                
-                async fn stream_multiple_openai_completions(
-                    endpoint: &str,
-                    model: &str,
-                    api_key: &str,
-                    prompt: &str,
-                    num_completions: usize,
-                ) -> anyhow::Result<Vec<String>> {
-                    let futures = (0..num_completions).map(|_| {
-                        let prompt = prompt.to_string();
-                        let endpoint = endpoint.to_string();
-                        let model = model.to_string();
-                        let api_key = api_key.to_string();
-                        //let debug_log = debug_log.clone();
-                        tokio::spawn(async move {
-                            let result = stream_openai_completion(&endpoint, &model, &api_key, &prompt).await;
-                            if let Err(ref e) = result {
-                                //let mut dbg = debug_log.lock().unwrap();
-                                //dbg.push_str(&format!("\nOpenAI API error: {}", e));
-                            }
-                            result
-                        })
-                    });
-                    
-                    let results = join_all(futures).await;
+                    result
+                })
+            });
+            
+            let results = join_all(futures).await;
 
-                    for result in &results {
-                        match result {
-                            Ok(Ok(completion)) => {
-                                // Use the completion
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!("OpenAI API error: {}", e);
-                                //let mut dbg = debug_log.lock().unwrap();
-                                //dbg.push_str(&format!("OpenAI API error: {}", e));
-                            }
-                            Err(e) => {
-                                // This is a tokio::JoinError
-                                eprintln!("Task join error: {}", e);
-                                //let mut dbg = debug_log.lock().unwrap();
-                                //dbg.push_str(&format!("OpenAI API error: {}", e));
-                            }
-                        }
+            for result in &results {
+                match result {
+                    Ok(Ok(completion)) => {
+                        // Use the completion
                     }
-                    
-                    // Now collect successful completions by value
-                    let completions: Vec<String> = results.into_iter()
-                        .filter_map(|res| res.ok())
-                        .filter_map(|res| res.ok())
-                        .collect();
-                    
-                    Ok(completions)
+                    Ok(Err(e)) => {
+                        eprintln!("OpenAI API error: {}", e);
+                        //let mut dbg = debug_log.lock().unwrap();
+                        //dbg.push_str(&format!("OpenAI API error: {}", e));
+                    }
+                    Err(e) => {
+                        // This is a tokio::JoinError
+                        eprintln!("Task join error: {}", e);
+                        //let mut dbg = debug_log.lock().unwrap();
+                        //dbg.push_str(&format!("OpenAI API error: {}", e));
+                    }
                 }
+            }
+            
+            // Now collect successful completions by value
+            let completions: Vec<String> = results.into_iter()
+                .filter_map(|res| res.ok())
+                .filter_map(|res| res.ok())
+                .collect();
+            
+            Ok(completions)
+        }
