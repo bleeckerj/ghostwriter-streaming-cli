@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #![allow(unused)]
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use async_openai::types::*;
 use async_openai::Client;
@@ -53,7 +54,7 @@ struct App {
     cursor_line: usize,     // Line number (0-based)
     cursor_col: usize,      // Column in line (0-based, in chars)
     scroll_line_offset: usize, // First visible line in viewport
-    debug_message: String,
+    debug_message: Arc<Mutex<String>>,
     waiting_for_user_input: bool,
     editor_width: usize,
 }
@@ -71,7 +72,7 @@ impl App {
             cursor_line: 0,
             cursor_col: 0,
             scroll_line_offset: 0,
-            debug_message: String::new(),
+            debug_message: Arc::new(Mutex::new(String::new())),
             waiting_for_user_input: false,
             editor_width: 0,
         }
@@ -178,28 +179,21 @@ impl App {
     
     /// Returns (visual_line_idx, col_in_visual) for the current cursor_col in the logical line.
     fn get_visual_cursor(&self, line: &str, width: usize, cursor_col: usize) -> (usize, usize) {
-        let mut visual_idx = 0;
-        let mut col_in_visual = cursor_col;
-        let mut count = 0;
-        let mut chars = line.chars();
-        while count < cursor_col {
-            let mut visual_width = 0;
-            let mut visual_count = 0;
-            while visual_width < width && count < cursor_col {
-                if let Some(_) = chars.next() {
-                    visual_width += 1;
-                    visual_count += 1;
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-            if count < cursor_col {
-                visual_idx += 1;
-                col_in_visual -= visual_count;
+        let visual_lines = self.get_visual_lines(line, width);
+        let mut remaining_cols = cursor_col;
+        for (visual_idx, (start, end)) in visual_lines.iter().enumerate() {
+            let visual_line_len = line[*start..*end].chars().count();
+            if remaining_cols <= visual_line_len {
+                return (visual_idx, remaining_cols);
+            } else {
+                remaining_cols -= visual_line_len;
             }
         }
-        (visual_idx, col_in_visual)
+        // If cursor_col exceeds line length, place cursor at end
+        if let Some((last_idx, (start, end))) = visual_lines.iter().enumerate().last() {
+            return (last_idx, line[*start..*end].chars().count());
+        }
+        (0, 0)
     }
     
     /// Move the cursor up by one visual line (wrap row).
@@ -336,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
                             if !app.current_completion().is_empty() {
                                 Span::styled(
                                     app.current_completion(),
-                                    Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC | Modifier::BOLD),
                                 )
                             } else {
                                 Span::raw("") // Render nothing if there is no completion text
@@ -361,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
                     f.render_widget(Paragraph::new(separator), chunks[1]);
                     
                     // Debug area
-                    let debug = Paragraph::new(app.debug_message.clone())
+                    let debug = Paragraph::new(app.debug_message.lock().unwrap().clone())
                     .block(Block::default().borders(Borders::ALL).title("Debug"))
                     .style(Style::default().fg(Color::Yellow));
                     f.render_widget(debug, chunks[2]);
@@ -391,10 +385,10 @@ async fn main() -> anyhow::Result<()> {
                     let cursor_x = cursor_x.min(max_x);
                     
                     f.set_cursor_position(ratatui::layout::Position { x: cursor_x, y: cursor_y });
-                    app.debug_message = format!(
+                    app.debug_message.lock().unwrap().push_str(&format!(
                         "cursor_x: {}, cursor_y: {}, line: {}, col: {}, pos: {}",
                         cursor_x, cursor_y, app.cursor_line, app.cursor_col, app.cursor_position
-                    );
+                    ));
                 })?;
                 
                 if event::poll(Duration::from_millis(100))? {
@@ -420,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
                                 ..
                             } => {
                                 // Ctrl-Down: next completion
+                                //let debug_log = Arc::clone(&app.debug_message);
                                 app.next_completion();
                                 // If we're at or near the end, trigger load more
                                 if app.should_load_more() && !app.completion_in_progress {
@@ -428,12 +423,19 @@ async fn main() -> anyhow::Result<()> {
                                     app.completion_in_progress = true;
                                     let args_clone = args.clone();
                                     let api_key_clone = api_key.clone();
+                                    //let debug_log = Arc::clone(&app.debug_message);
                                     tokio::spawn(async move {
+                                        {
+                                            // let mut dbg = debug_log.lock().unwrap();
+                                            // dbg.push_str("Some debug info");
+                                        } // lock is dropped here, BEFORE any await
+
                                         let effective_model = if args_clone.endpoint == "openai" {
                                             args_clone.model
                                         } else {
                                             args_clone.lm_model
                                         };
+
                                         if let Ok(completions) = stream_multiple_openai_completions(
                                             &args_clone.endpoint, &effective_model, &api_key_clone, &prompt, 3
                                         ).await {
@@ -528,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             KeyEvent { code: KeyCode::Esc, .. } => {
-                                app.debug_message.push_str(stringify!("\nExiting..."));
+                                //app.debug_message.lock().unwrap().push_str(stringify!("\nExiting..."));
                                 break
                             }
                             KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. } => {
@@ -590,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
                             lm_model  // Use LM Studio model here
                         };
                         
+                        //let debug_log = app.debug_message.clone();
                         if let Ok(completions) = stream_multiple_openai_completions(&endpoint, &effective_model, &api_key_clone, &prompt, 3).await {
                             if !completions.is_empty() {
                                 let _ = tx_clone.send(completions).await;
@@ -600,9 +603,9 @@ async fn main() -> anyhow::Result<()> {
                 
                 // Check if the completion task has finished:
                 if let Ok(new_completions) = rx.try_recv() {
-                    app.debug_message = format!("Received {} completions", new_completions.len());
-                    app.debug_message.push_str("\nCompletions: ");
-                    app.debug_message.push_str(&new_completions.join(", "));
+                    app.debug_message.lock().unwrap().push_str(&format!("Received {} completions", new_completions.len()));
+                    app.debug_message.lock().unwrap().push_str("\nCompletions: ");
+                    app.debug_message.lock().unwrap().push_str(&new_completions.join(", "));
                     if app.completions.is_empty() {
                         // First set of completions
                         app.completions = new_completions.clone();
@@ -652,6 +655,8 @@ async fn main() -> anyhow::Result<()> {
                     Input: “The sun was just rising over the hills”
                     Output: “and the dew still clung to the grass, sparkling like glass.” 
                     Never begin with “...” or any symbols.
+                    Do not provide answers, suggestions, or explanations in any form.
+                    Do not use any special characters, punctuation, or formatting.
                     Do not wrap the output with quotation marks or any other characters. 
                     Never begin with a quotation mark. You are completing text, not provide a quotation.
                     Do not use any special formatting like bullet points, lists, or numbered items.
@@ -740,25 +745,55 @@ async fn main() -> anyhow::Result<()> {
                 }
                 
                 
-                async fn stream_multiple_openai_completions(endpoint: &str, model: &str, api_key: &str, prompt: &str, num_completions: usize) -> anyhow::Result<Vec<String>> {
+                async fn stream_multiple_openai_completions(
+                    endpoint: &str,
+                    model: &str,
+                    api_key: &str,
+                    prompt: &str,
+                    num_completions: usize,
+                ) -> anyhow::Result<Vec<String>> {
                     let futures = (0..num_completions).map(|_| {
                         let prompt = prompt.to_string();
                         let endpoint = endpoint.to_string();
                         let model = model.to_string();
                         let api_key = api_key.to_string();
-                        
+                        //let debug_log = debug_log.clone();
                         tokio::spawn(async move {
-                            stream_openai_completion(&endpoint, &model, &api_key, &prompt).await
+                            let result = stream_openai_completion(&endpoint, &model, &api_key, &prompt).await;
+                            if let Err(ref e) = result {
+                                //let mut dbg = debug_log.lock().unwrap();
+                                //dbg.push_str(&format!("\nOpenAI API error: {}", e));
+                            }
+                            result
                         })
                     });
                     
                     let results = join_all(futures).await;
+
+                    for result in &results {
+                        match result {
+                            Ok(Ok(completion)) => {
+                                // Use the completion
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("OpenAI API error: {}", e);
+                                //let mut dbg = debug_log.lock().unwrap();
+                                //dbg.push_str(&format!("OpenAI API error: {}", e));
+                            }
+                            Err(e) => {
+                                // This is a tokio::JoinError
+                                eprintln!("Task join error: {}", e);
+                                //let mut dbg = debug_log.lock().unwrap();
+                                //dbg.push_str(&format!("OpenAI API error: {}", e));
+                            }
+                        }
+                    }
                     
-                    // Collect successful completions
+                    // Now collect successful completions by value
                     let completions: Vec<String> = results.into_iter()
-                    .filter_map(|res| res.ok())
-                    .filter_map(|res| res.ok())
-                    .collect();
+                        .filter_map(|res| res.ok())
+                        .filter_map(|res| res.ok())
+                        .collect();
                     
                     Ok(completions)
                 }
