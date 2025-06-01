@@ -55,6 +55,7 @@ struct App {
     scroll_line_offset: usize, // First visible line in viewport
     debug_message: String,
     waiting_for_user_input: bool,
+    editor_width: usize,
 }
 
 impl App {
@@ -72,6 +73,7 @@ impl App {
             scroll_line_offset: 0,
             debug_message: String::new(),
             waiting_for_user_input: false,
+            editor_width: 0,
         }
     }
     
@@ -151,6 +153,98 @@ impl App {
         }
         self.cursor_position = pos;
     }
+    
+    /// Returns a Vec of (start_byte, end_byte) for each visual line in the current logical line.
+    fn get_visual_lines(&self, line: &str, width: usize) -> Vec<(usize, usize)> {
+        let mut visual_lines = Vec::new();
+        let mut start = 0;
+        let mut current_width = 0;
+        let mut last_break = 0;
+        for (idx, c) in line.char_indices() {
+            current_width += 1;
+            if current_width > width {
+                visual_lines.push((start, idx));
+                start = idx;
+                current_width = 1;
+            }
+            last_break = idx + c.len_utf8();
+        }
+        // Push the last segment
+        if start < line.len() {
+            visual_lines.push((start, line.len()));
+        }
+        visual_lines
+    }
+    
+    /// Returns (visual_line_idx, col_in_visual) for the current cursor_col in the logical line.
+    fn get_visual_cursor(&self, line: &str, width: usize, cursor_col: usize) -> (usize, usize) {
+        let mut visual_idx = 0;
+        let mut col_in_visual = cursor_col;
+        let mut count = 0;
+        let mut chars = line.chars();
+        while count < cursor_col {
+            let mut visual_width = 0;
+            let mut visual_count = 0;
+            while visual_width < width && count < cursor_col {
+                if let Some(_) = chars.next() {
+                    visual_width += 1;
+                    visual_count += 1;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            if count < cursor_col {
+                visual_idx += 1;
+                col_in_visual -= visual_count;
+            }
+        }
+        (visual_idx, col_in_visual)
+    }
+    
+    /// Move the cursor up by one visual line (wrap row).
+    pub fn move_cursor_up_visual(&mut self, width: usize) {
+        let line = self.input.split('\n').nth(self.cursor_line).unwrap_or("");
+        let visual_lines = self.get_visual_lines(line, width);
+        let (visual_idx, col_in_visual) = self.get_visual_cursor(line, width, self.cursor_col);
+        if visual_idx > 0 {
+            // Move to previous visual line, clamp col
+            let (start, end) = visual_lines[visual_idx - 1];
+            let prev_len = line[start..end].chars().count();
+            let new_col = start + col_in_visual.min(prev_len);
+            self.cursor_col = line[..new_col].chars().count();
+            self.set_cursor_from_line_col();
+        } else if self.cursor_line > 0 {
+            // Move to end of previous logical line
+            self.cursor_line -= 1;
+            let prev_line = self.input.split('\n').nth(self.cursor_line).unwrap_or("");
+            let prev_visual_lines = self.get_visual_lines(prev_line, width);
+            let (start, end) = *prev_visual_lines.last().unwrap();
+            let prev_len = prev_line[start..end].chars().count();
+            self.cursor_col = prev_line.len().min(prev_line[..end].chars().count());
+            self.set_cursor_from_line_col();
+        }
+    }
+    
+    /// Move the cursor down by one visual line (wrap row).
+    pub fn move_cursor_down_visual(&mut self, width: usize) {
+        let line = self.input.split('\n').nth(self.cursor_line).unwrap_or("");
+        let visual_lines = self.get_visual_lines(line, width);
+        let (visual_idx, col_in_visual) = self.get_visual_cursor(line, width, self.cursor_col);
+        if visual_idx + 1 < visual_lines.len() {
+            // Move to next visual line, clamp col
+            let (start, end) = visual_lines[visual_idx + 1];
+            let next_len = line[start..end].chars().count();
+            let new_col = start + col_in_visual.min(next_len);
+            self.cursor_col = line[..new_col].chars().count();
+            self.set_cursor_from_line_col();
+        } else if self.cursor_line + 1 < self.input.lines().count() {
+            // Move to start of next logical line
+            self.cursor_line += 1;
+            self.cursor_col = 0;
+            self.set_cursor_from_line_col();
+        }
+    }
 }
 
 #[tokio::main]
@@ -193,6 +287,8 @@ async fn main() -> anyhow::Result<()> {
                 Constraint::Length(8),   // Debug area (2 lines tall)
                 ])
                 .split(size);
+                
+                app.editor_width = chunks[0].width as usize - 2; // minus borders
                 
                 let lines: Vec<&str> = app.input.split('\n').collect();
                 let max_visible_lines = chunks[0].height as usize - 2; // minus borders
@@ -266,8 +362,29 @@ async fn main() -> anyhow::Result<()> {
                     f.render_widget(debug, chunks[2]);
                     
                     // After rendering the main editor area (paragraph)
-                    let cursor_y = chunks[0].y + 1 + (app.cursor_line - app.scroll_line_offset) as u16;
+                    let current_line = lines.get(app.cursor_line).unwrap_or(&"");
+                    let editor_width = chunks[0].width as usize - 2; // minus borders
+                    
+                    // Calculate visual position accounting for wrapping
+                    let visual_line = app.cursor_col / editor_width;
+                    let visual_col = app.cursor_col % editor_width;
+                    
+                    // Simple cursor positioning that matches soft-wrapped rendering
+                    let base_y = chunks[0].y + 1;
+                    let line_offset = if app.cursor_line >= app.scroll_line_offset {
+                        app.cursor_line - app.scroll_line_offset
+                    } else {
+                        0
+                    };
+                    
+                    // Don't try to calculate wrapping - let the terminal handle it naturally
+                    let cursor_y = base_y.saturating_add(line_offset as u16);
                     let cursor_x = chunks[0].x + 1 + app.cursor_col as u16;
+                    
+                    // Clamp to editor bounds
+                    let max_x = chunks[0].x + chunks[0].width - 2;
+                    let cursor_x = cursor_x.min(max_x);
+                    
                     f.set_cursor_position(ratatui::layout::Position { x: cursor_x, y: cursor_y });
                     app.debug_message = format!(
                         "cursor_x: {}, cursor_y: {}, line: {}, col: {}, pos: {}",
@@ -405,28 +522,15 @@ async fn main() -> anyhow::Result<()> {
                                     app.cursor_position = app.input.len();
                                 }
                             }
-                            KeyEvent { code: KeyCode::Esc, .. } => break,
+                            KeyEvent { code: KeyCode::Esc, .. } => {
+                                app.debug_message.push_str(stringify!("\nExiting..."));
+                                break
+                            }
                             KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. } => {
-                                app.debug_message = format!("Up pressed! line: {}", app.cursor_line);
-                                
-                                if app.cursor_line > 0 {
-                                    app.cursor_line -= 1;
-                                    // Optionally clamp cursor_col to new line length:
-                                    let new_line_len = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
-                                    app.cursor_col = app.cursor_col.min(new_line_len);
-                                    app.set_cursor_from_line_col();
-                                }
+                                app.move_cursor_up_visual(app.editor_width);
                             }
                             KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. } => {
-                                app.debug_message = format!("Down pressed! line: {}", app.cursor_line);
-                                
-                                let total_lines = app.input.lines().count();
-                                if app.cursor_line + 1 < total_lines {
-                                    app.cursor_line += 1;
-                                    let new_line_len = app.input.lines().nth(app.cursor_line).unwrap_or("").chars().count();
-                                    app.cursor_col = app.cursor_col.min(new_line_len);
-                                    app.set_cursor_from_line_col();
-                                }
+                                app.move_cursor_down_visual(app.editor_width);
                             }
                             KeyEvent { code: KeyCode::Left, modifiers: KeyModifiers::NONE, .. } => {
                                 if app.cursor_col > 0 {
