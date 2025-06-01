@@ -332,10 +332,15 @@ async fn main() -> anyhow::Result<()> {
                             Span::raw(before),
                             Span::styled(at, Style::default().bg(Color::White).fg(Color::Black)),
                             Span::raw(after),
-                            Span::styled(
-                                app.current_completion(),
-                                Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC),
-                            ),
+                            // Render the blue box only if there is completion text
+                            if !app.current_completion().is_empty() {
+                                Span::styled(
+                                    app.current_completion(),
+                                    Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC),
+                                )
+                            } else {
+                                Span::raw("") // Render nothing if there is no completion text
+                            },
                             ]));
                         } else {
                             styled_lines.push(Line::from(vec![Span::raw(*line)]));
