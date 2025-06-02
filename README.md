@@ -8,9 +8,9 @@ The **Ghostwriter UX Exploration CLI** is a terminal-based text editor that lets
 
 ---
 
-## Philosophical Context
+## Culture & Philosophical Context
 
-This project is informed by a broader cultural and philosophical conversation about AI, creativity, and the future of human-machine relations. For deeper context, consider these thought-provoking essays:
+This project is informed by a broader cultural and philosophical conversation about AI, creativity, and the future of human-machine relations. Most of this came about while trying to find a better tool for writing by thinking of the LLM more as a collaborator rather than a question-answerer or task doer. Found some essays that are helpful in that context:
 
 - [Remarks on AI from NZ by Neal Stephenson](https://nealstephenson.substack.com/p/remarks-on-ai-from-nz):  
   Stephenson reflects on the evolving relationship between humans and AI, and the need for new metaphors and practices for living with these "companion species."
@@ -20,6 +20,9 @@ This project is informed by a broader cultural and philosophical conversation ab
 
 - [Zero Cool and the Oraculator by Near Future Laboratory](https://nearfuturelaboratory.com/blog/2025/05/zero-cool-and-the-oraculator/):  
   A meditation on the shifting boundaries between human and machine agency, and the playful, experimental spirit needed to invent new forms of interaction.
+
+- [Can AI Writing Be More Than A Gimmick](https://www.newyorker.com/books/under-review/can-ai-writing-be-more-than-a-gimmick):
+  The essay collection *Searches: Selfhood in the Digital Age* by Vauhini Vara explores the intersection of artificial intelligence and personal writing. Vara, a novelist and tech journalist, initially experimented with large language models like ChatGPT to aid her writing, particularly during moments where she felt blocked or needed help expressing grief about her sister's death. Initially, she was wary of AI threatening her craft but eventually found its potential to elicit rather than supply text.
 
 ---
 
