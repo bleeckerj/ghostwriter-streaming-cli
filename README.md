@@ -115,6 +115,13 @@ The AI completions are designed to continue your text naturally without adding q
 
 4. **Reflect on the experience**: How does it feel to write with an AI companion? What new forms of creativity emerge?
 
+5. **Build it into a double-clickable app**: This is not necessary and just an experiment.
+  Run `src/build-macos-app.sh` from the command line.
+  
+  This will create a macOS Application Bundle — but without any command line arguments passed to it. This means that you'll need to have your OPENAI_API_KEY in your environment so that it is accessible by the application.
+
+  Set environment variables (like OPENAI_API_KEY) in your shell profile (~/.zshrc, ~/.bash_profile, etc.) or via a .env file that your app loads at startup.
+
 ---
 
 ## Further Reading
