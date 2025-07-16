@@ -86,7 +86,7 @@ The AI completions are designed to continue your text naturally without adding q
 1. **Clone the repo and build with Cargo** (requires Rust and a compatible AI backend):
 
     ```sh
-    git clone https://github.com/yourusername/ghostwriter_streaming_cli.git
+    git clone https://github.com/bleeckerj/ghostwriter_streaming_cli.git
     cd ghostwriter_streaming_cli
     cargo build --release
     ```
@@ -122,6 +122,7 @@ The AI completions are designed to continue your text naturally without adding q
 
   Set environment variables (like OPENAI_API_KEY) in your shell profile (~/.zshrc, ~/.bash_profile, etc.) or via a .env file that your app loads at startup.
 
+6. **
 ---
 
 ## Further Reading
