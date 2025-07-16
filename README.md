@@ -112,6 +112,8 @@ The AI completions are designed to continue your text naturally without adding q
     - Press `Tab` to accept AI completions.
     - Press `Shift+Up/Down` to cycle suggestions.
     - Use arrow keys to move the cursor.
+    - `ESC` to exit the editor.
+
 
 4. **Reflect on the experience**: How does it feel to write with an AI companion? What new forms of creativity emerge?
 
